@@ -566,6 +566,9 @@
 
         // マルチストレージ・セーブ＆ロード制御用定数・フラグ
         const LOCAL_STORAGE_KEY = 'tasubake_save_data_v1';
+        const COOKIE_STORAGE_KEY = 'tasubake_sv1';
+        const CACHE_STORAGE_NAME = 'tasubake-save-cache-v1';
+        const CACHE_REQUEST_URL = 'https://tasubake.local/save-data-v1.json';
         const IDB_DB_NAME = 'TasubakeMultiStorageDB';
         const IDB_STORE_NAME = 'saveDataStore';
         const IDB_RECORD_KEY = 'latestSave';
@@ -574,6 +577,7 @@
         let isInitialLoadComplete = false; // ロード完了前の誤上書き防止フラグ
         let isAppInitialized = false;      // 初期化二重実行防止フラグ
         let lastSavedTimestamp = 0;        // 最後に保存/復元したデータのタイムスタンプ
+        let saveQueuePromise = Promise.resolve(); // 非同期ストレージ書き込み直列化キュー
 
         // Firebase & Cloud Save
         let db = null;
@@ -647,7 +651,6 @@
                 if (b.timestamp !== a.timestamp) {
                     return b.timestamp - a.timestamp;
                 }
-                // タイムスタンプが同一の場合はクリア数・所持カード数が多い方を優先
                 const aCleared = a.clearedFlags.filter(Boolean).length;
                 const bCleared = b.clearedFlags.filter(Boolean).length;
                 if (bCleared !== aCleared) {
@@ -703,7 +706,7 @@
             }
         }
 
-        // --- 3. window.name 読み書き (サンドボックス環境のリロード対策) ---
+        // --- 3. window.name 読み書き ---
         function readFromWindowName() {
             try {
                 if (typeof window.name !== 'string') return null;
@@ -725,7 +728,71 @@
             }
         }
 
-        // --- 4. IndexedDB 読み書き (ローカルHTML直開き・ブラウザ再起動後の永続化対策) ---
+        // --- 4. Cookie 読み書き (コンパクト圧縮形式) ---
+        function readFromCookie() {
+            try {
+                if (typeof document === 'undefined' || typeof document.cookie !== 'string') return null;
+                const cookies = document.cookie.split(';');
+                let targetVal = null;
+                for (let i = 0; i < cookies.length; i++) {
+                    const part = cookies[i].trim();
+                    if (part.startsWith(COOKIE_STORAGE_KEY + '=')) {
+                        targetVal = part.slice(COOKIE_STORAGE_KEY.length + 1);
+                        break;
+                    }
+                }
+                if (!targetVal) return null;
+                const decoded = decodeURIComponent(targetVal);
+                const segments = decoded.split('|');
+                if (segments.length < 4) return null;
+
+                const ts = parseInt(segments[0], 36) || 0;
+                const qIdx = parseInt(segments[1], 10) || 0;
+                const bits = segments[2] || '';
+                const cardsPart = segments[3] || '';
+                const soundFlag = segments[4] !== '0';
+
+                const flags = new Array(TOTAL_QUESTIONS).fill(false);
+                for (let i = 0; i < TOTAL_QUESTIONS; i++) {
+                    flags[i] = bits[i] === '1';
+                }
+                const cards = cardsPart
+                    ? cardsPart.split(',').filter(Boolean).map(n => 'b' + n)
+                    : [];
+
+                return normalizeSaveData({
+                    timestamp: ts,
+                    currentGlobalQIdx: qIdx,
+                    clearedFlags: flags,
+                    ownedCards: cards,
+                    isSoundEnabled: soundFlag
+                });
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function writeToCookie(payload) {
+            try {
+                if (typeof document === 'undefined') return false;
+                const tsEncoded = Math.max(0, Math.floor(payload.timestamp || Date.now())).toString(36);
+                const qIdxEncoded = String(payload.currentGlobalQIdx || 0);
+                const bitsEncoded = payload.clearedFlags.map(f => (f ? '1' : '0')).join('');
+                const cardsEncoded = (payload.ownedCards || [])
+                    .map(id => String(id).replace(/^b/, ''))
+                    .filter(Boolean)
+                    .join(',');
+                const soundEncoded = payload.isSoundEnabled ? '1' : '0';
+
+                const compact = [tsEncoded, qIdxEncoded, bitsEncoded, cardsEncoded, soundEncoded].join('|');
+                document.cookie = `${COOKIE_STORAGE_KEY}=${encodeURIComponent(compact)}; max-age=31536000; path=/; SameSite=Lax`;
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        // --- 5. IndexedDB 読み書き (tx.oncomplete 待機 & 接続クローズ保証) ---
         function openSaveIndexedDB() {
             return new Promise((resolve) => {
                 try {
@@ -739,7 +806,7 @@
                             settled = true;
                             resolve(null);
                         }
-                    }, 1500);
+                    }, 5000);
 
                     const request = window.indexedDB.open(IDB_DB_NAME, 1);
 
@@ -759,6 +826,8 @@
                         if (!settled) {
                             settled = true;
                             resolve(event.target.result);
+                        } else {
+                            try { event.target.result.close(); } catch (e) {}
                         }
                     };
 
@@ -787,35 +856,44 @@
             const idb = await openSaveIndexedDB();
             if (!idb) return null;
             return new Promise((resolve) => {
-                try {
-                    let settled = false;
-                    const timer = setTimeout(() => {
-                        if (!settled) {
-                            settled = true;
-                            resolve(null);
-                        }
-                    }, 1500);
+                let settled = false;
+                const finish = (val) => {
+                    if (settled) return;
+                    settled = true;
+                    try { idb.close(); } catch (e) {}
+                    resolve(val);
+                };
 
+                const timer = setTimeout(() => finish(null), 5000);
+
+                try {
                     const tx = idb.transaction(IDB_STORE_NAME, 'readonly');
                     const store = tx.objectStore(IDB_STORE_NAME);
                     const getReq = store.get(IDB_RECORD_KEY);
+                    let resultData = null;
 
                     getReq.onsuccess = () => {
-                        clearTimeout(timer);
-                        if (!settled) {
-                            settled = true;
-                            resolve(normalizeSaveData(getReq.result));
-                        }
+                        resultData = normalizeSaveData(getReq.result);
                     };
                     getReq.onerror = () => {
                         clearTimeout(timer);
-                        if (!settled) {
-                            settled = true;
-                            resolve(null);
-                        }
+                        finish(null);
+                    };
+                    tx.oncomplete = () => {
+                        clearTimeout(timer);
+                        finish(resultData);
+                    };
+                    tx.onerror = () => {
+                        clearTimeout(timer);
+                        finish(resultData);
+                    };
+                    tx.onabort = () => {
+                        clearTimeout(timer);
+                        finish(null);
                     };
                 } catch (e) {
-                    resolve(null);
+                    clearTimeout(timer);
+                    finish(null);
                 }
             });
         }
@@ -824,37 +902,67 @@
             const idb = await openSaveIndexedDB();
             if (!idb) return false;
             return new Promise((resolve) => {
-                try {
-                    let settled = false;
-                    const timer = setTimeout(() => {
-                        if (!settled) {
-                            settled = true;
-                            resolve(false);
-                        }
-                    }, 1500);
+                let settled = false;
+                const finish = (ok) => {
+                    if (settled) return;
+                    settled = true;
+                    try { idb.close(); } catch (e) {}
+                    resolve(ok);
+                };
 
+                const timer = setTimeout(() => finish(false), 5000);
+
+                try {
                     const tx = idb.transaction(IDB_STORE_NAME, 'readwrite');
                     const store = tx.objectStore(IDB_STORE_NAME);
-                    const putReq = store.put(payload, IDB_RECORD_KEY);
+                    store.put(payload, IDB_RECORD_KEY);
 
-                    putReq.onsuccess = () => {
+                    // ディスクへのコミット完了（tx.oncomplete）を確実に待機する
+                    tx.oncomplete = () => {
                         clearTimeout(timer);
-                        if (!settled) {
-                            settled = true;
-                            resolve(true);
-                        }
+                        finish(true);
                     };
-                    putReq.onerror = () => {
+                    tx.onerror = () => {
                         clearTimeout(timer);
-                        if (!settled) {
-                            settled = true;
-                            resolve(false);
-                        }
+                        finish(false);
+                    };
+                    tx.onabort = () => {
+                        clearTimeout(timer);
+                        finish(false);
                     };
                 } catch (e) {
-                    resolve(false);
+                    clearTimeout(timer);
+                    finish(false);
                 }
             });
+        }
+
+        // --- 6. Cache API 読み書き ---
+        async function readFromCacheStorage() {
+            try {
+                if (typeof window.caches === 'undefined') return null;
+                const cache = await window.caches.open(CACHE_STORAGE_NAME);
+                const res = await cache.match(CACHE_REQUEST_URL);
+                if (!res) return null;
+                const data = await res.json();
+                return normalizeSaveData(data);
+            } catch (e) {
+                return null;
+            }
+        }
+
+        async function writeToCacheStorage(payload) {
+            try {
+                if (typeof window.caches === 'undefined') return false;
+                const cache = await window.caches.open(CACHE_STORAGE_NAME);
+                const res = new Response(JSON.stringify(payload), {
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                await cache.put(CACHE_REQUEST_URL, res);
+                return true;
+            } catch (e) {
+                return false;
+            }
         }
 
         // 復元データをメモリ状態とUIに反映
@@ -883,35 +991,50 @@
             }
         }
 
-        // 同期ローカルストレージ（localStorage / sessionStorage / window.name）への即時書き込み
+        // 同期ローカルストレージ（localStorage / sessionStorage / window.name / Cookie）への即時書き込み
         function writeToSyncStorages(payload) {
             writeToLocalStorage(payload);
             writeToSessionStorage(payload);
             writeToWindowName(payload);
+            writeToCookie(payload);
         }
 
-        // 全ローカルストレージ（同期3種 + IndexedDB）への多重書き込み
-        async function writeToAllLocalStorages(payload) {
+        // 全ローカルストレージ（同期4種 + IndexedDB + Cache API）への直列化多重書き込み
+        function writeToAllLocalStorages(payload) {
             writeToSyncStorages(payload);
-            await writeToIndexedDB(payload);
+            saveQueuePromise = saveQueuePromise
+                .then(async () => {
+                    await Promise.all([
+                        writeToIndexedDB(payload),
+                        writeToCacheStorage(payload)
+                    ]);
+                })
+                .catch(() => {});
+            return saveQueuePromise;
         }
 
-        // 起動時の即時マルチストレージ復元（同期ストレージ優先→IndexedDB照合）
+        // 起動時の即時マルチストレージ復元（同期ストレージ優先→非同期ディスクストレージ照合）
         async function restoreLocalSaveDataImmediately() {
-            // 1. 同期ストレージ（localStorage, sessionStorage, window.name）を即座に照合・反映
+            // 1. 同期ストレージ（localStorage, sessionStorage, window.name, Cookie）を即座に照合・反映
             const syncCandidates = [
                 readFromLocalStorage(),
                 readFromSessionStorage(),
-                readFromWindowName()
+                readFromWindowName(),
+                readFromCookie()
             ];
             const latestSync = selectLatestSaveData(syncCandidates);
             if (latestSync) {
                 applySaveDataToState(latestSync);
             }
 
-            // 2. IndexedDB（ディスク永続化領域）から非同期読み込みしてタイムスタンプ比較
-            const idbData = await readFromIndexedDB();
-            const allCandidates = [...syncCandidates, idbData];
+            // 2. IndexedDB と Cache API（ディスク永続化領域）から並列読み込みしてタイムスタンプ比較
+            const [idbData, cacheData] = await Promise.all([
+                readFromIndexedDB(),
+                readFromCacheStorage()
+            ]);
+
+            const currentMemory = lastSavedTimestamp > 0 ? buildCurrentSavePayload(lastSavedTimestamp) : null;
+            const allCandidates = [...syncCandidates, idbData, cacheData, currentMemory];
             const overallLatest = selectLatestSaveData(allCandidates);
 
             // 初期ロード完了をマーク（これ以前の誤上書きを完全に遮断）
@@ -927,11 +1050,9 @@
         // ページ離脱・バックグラウンド移行時の緊急セーブ
         function handlePageLifecycleSave() {
             if (!isInitialLoadComplete) return;
+            if (lastSavedTimestamp <= 0 && !clearedFlags.some(Boolean) && ownedCards.length === 0) return;
             const payload = buildCurrentSavePayload(lastSavedTimestamp || Date.now());
-            // 同期ストレージへ即時書き込み
-            writeToSyncStorages(payload);
-            // IndexedDBへも非同期書き込みをキック
-            writeToIndexedDB(payload);
+            writeToAllLocalStorages(payload);
         }
 
         async function initFirebase() {
@@ -980,7 +1101,6 @@
                         await writeToAllLocalStorages(winner);
                     }
                 } else if (isInitialLoadComplete && lastSavedTimestamp > 0) {
-                    // クラウドが空でローカルに既存データがある場合はクラウドへ同期
                     await saveProgress();
                 }
             } catch (err) {
@@ -1001,7 +1121,7 @@
             const payload = buildCurrentSavePayload();
             lastSavedTimestamp = payload.timestamp;
 
-            // 1. localStorage, sessionStorage, window.name, IndexedDB へ多重保存
+            // 1. 全6種類のローカルストレージへ多重保存
             await writeToAllLocalStorages(payload);
 
             // 2. Firebaseが有効な場合はクラウドへも保存
@@ -1120,9 +1240,18 @@
             // 終了時・バックグラウンド移行時の確実な保存イベント登録
             window.addEventListener('beforeunload', handlePageLifecycleSave);
             window.addEventListener('pagehide', handlePageLifecycleSave);
+            document.addEventListener('freeze', handlePageLifecycleSave);
             document.addEventListener('visibilitychange', () => {
                 if (document.visibilityState === 'hidden') {
                     handlePageLifecycleSave();
+                } else if (document.visibilityState === 'visible' && isInitialLoadComplete) {
+                    restoreLocalSaveDataImmediately();
+                }
+            });
+            // bfcache（ブラウザバック・再アクティブ化）復元時にも最新データを再照合
+            window.addEventListener('pageshow', (event) => {
+                if (event.persisted) {
+                    restoreLocalSaveDataImmediately();
                 }
             });
 
@@ -1244,6 +1373,7 @@
         function startFromQuestion(globalIdx) {
             currentGlobalQIdx = globalIdx;
             enteredDigits = [];
+            saveProgress();
             document.getElementById('menu-screen').classList.add('hidden');
             document.getElementById('game-screen').classList.remove('hidden');
             document.getElementById('game-screen').classList.add('flex');
