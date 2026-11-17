@@ -564,11 +564,375 @@
         let isProcessingAnswer = false;
         let currentAlbumFilter = 'ALL';
 
+        // マルチストレージ・セーブ＆ロード制御用定数・フラグ
+        const LOCAL_STORAGE_KEY = 'tasubake_save_data_v1';
+        const IDB_DB_NAME = 'TasubakeMultiStorageDB';
+        const IDB_STORE_NAME = 'saveDataStore';
+        const IDB_RECORD_KEY = 'latestSave';
+        const WINDOW_NAME_PREFIX = '__TASUBAKE_SAVE_V1__:';
+
+        let isInitialLoadComplete = false; // ロード完了前の誤上書き防止フラグ
+        let isAppInitialized = false;      // 初期化二重実行防止フラグ
+        let lastSavedTimestamp = 0;        // 最後に保存/復元したデータのタイムスタンプ
+
         // Firebase & Cloud Save
         let db = null;
         let auth = null;
         let userId = null;
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'hissan-addition-bake-app';
+
+        // セーブデータの正規化・バリデーション
+        function normalizeSaveData(raw) {
+            if (!raw || typeof raw !== 'object') return null;
+            if (!Array.isArray(raw.clearedFlags) && !Array.isArray(raw.ownedCards)) return null;
+
+            const normalizedFlags = new Array(TOTAL_QUESTIONS).fill(false);
+            if (Array.isArray(raw.clearedFlags)) {
+                for (let i = 0; i < TOTAL_QUESTIONS; i++) {
+                    normalizedFlags[i] = Boolean(raw.clearedFlags[i]);
+                }
+            }
+
+            const normalizedCards = Array.isArray(raw.ownedCards)
+                ? Array.from(new Set(raw.ownedCards.filter(id => typeof id === 'string')))
+                : [];
+
+            let qIdx = 0;
+            if (typeof raw.currentGlobalQIdx === 'number' && !Number.isNaN(raw.currentGlobalQIdx)) {
+                qIdx = Math.max(0, Math.min(TOTAL_QUESTIONS - 1, Math.floor(raw.currentGlobalQIdx)));
+            }
+
+            let ts = 0;
+            if (typeof raw.timestamp === 'number' && !Number.isNaN(raw.timestamp)) {
+                ts = raw.timestamp;
+            } else if (typeof raw.updatedAt === 'string') {
+                const parsed = Date.parse(raw.updatedAt);
+                if (!Number.isNaN(parsed)) ts = parsed;
+            }
+
+            return {
+                version: 1,
+                timestamp: ts,
+                updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : new Date(ts || Date.now()).toISOString(),
+                clearedFlags: normalizedFlags,
+                ownedCards: normalizedCards,
+                currentGlobalQIdx: qIdx,
+                isSoundEnabled: typeof raw.isSoundEnabled === 'boolean' ? raw.isSoundEnabled : true
+            };
+        }
+
+        // 現在のゲーム状態からセーブオブジェクトを構築
+        function buildCurrentSavePayload(customTimestamp) {
+            const ts = typeof customTimestamp === 'number' ? customTimestamp : Math.max(Date.now(), lastSavedTimestamp + 1);
+            return {
+                version: 1,
+                timestamp: ts,
+                updatedAt: new Date(ts).toISOString(),
+                clearedFlags: clearedFlags.slice(0, TOTAL_QUESTIONS),
+                ownedCards: Array.from(new Set(ownedCards)),
+                currentGlobalQIdx: currentGlobalQIdx,
+                isSoundEnabled: isSoundEnabled
+            };
+        }
+
+        // 複数候補からタイムスタンプ比較で最新データを1つ選択
+        function selectLatestSaveData(candidates) {
+            const validList = candidates
+                .map(c => normalizeSaveData(c))
+                .filter(Boolean);
+
+            if (validList.length === 0) return null;
+
+            validList.sort((a, b) => {
+                if (b.timestamp !== a.timestamp) {
+                    return b.timestamp - a.timestamp;
+                }
+                // タイムスタンプが同一の場合はクリア数・所持カード数が多い方を優先
+                const aCleared = a.clearedFlags.filter(Boolean).length;
+                const bCleared = b.clearedFlags.filter(Boolean).length;
+                if (bCleared !== aCleared) {
+                    return bCleared - aCleared;
+                }
+                return b.ownedCards.length - a.ownedCards.length;
+            });
+
+            return validList[0];
+        }
+
+        // --- 1. localStorage 読み書き ---
+        function readFromLocalStorage() {
+            try {
+                if (typeof window.localStorage === 'undefined') return null;
+                const rawStr = window.localStorage.getItem(LOCAL_STORAGE_KEY);
+                if (!rawStr) return null;
+                return normalizeSaveData(JSON.parse(rawStr));
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function writeToLocalStorage(payload) {
+            try {
+                if (typeof window.localStorage === 'undefined') return false;
+                window.localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(payload));
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        // --- 2. sessionStorage 読み書き ---
+        function readFromSessionStorage() {
+            try {
+                if (typeof window.sessionStorage === 'undefined') return null;
+                const rawStr = window.sessionStorage.getItem(LOCAL_STORAGE_KEY);
+                if (!rawStr) return null;
+                return normalizeSaveData(JSON.parse(rawStr));
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function writeToSessionStorage(payload) {
+            try {
+                if (typeof window.sessionStorage === 'undefined') return false;
+                window.sessionStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(payload));
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        // --- 3. window.name 読み書き (サンドボックス環境のリロード対策) ---
+        function readFromWindowName() {
+            try {
+                if (typeof window.name !== 'string') return null;
+                if (!window.name.startsWith(WINDOW_NAME_PREFIX)) return null;
+                const jsonStr = window.name.slice(WINDOW_NAME_PREFIX.length);
+                if (!jsonStr) return null;
+                return normalizeSaveData(JSON.parse(jsonStr));
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function writeToWindowName(payload) {
+            try {
+                window.name = WINDOW_NAME_PREFIX + JSON.stringify(payload);
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        // --- 4. IndexedDB 読み書き (ローカルHTML直開き・ブラウザ再起動後の永続化対策) ---
+        function openSaveIndexedDB() {
+            return new Promise((resolve) => {
+                try {
+                    if (typeof window.indexedDB === 'undefined') {
+                        resolve(null);
+                        return;
+                    }
+                    let settled = false;
+                    const timer = setTimeout(() => {
+                        if (!settled) {
+                            settled = true;
+                            resolve(null);
+                        }
+                    }, 1500);
+
+                    const request = window.indexedDB.open(IDB_DB_NAME, 1);
+
+                    request.onupgradeneeded = (event) => {
+                        try {
+                            const idb = event.target.result;
+                            if (!idb.objectStoreNames.contains(IDB_STORE_NAME)) {
+                                idb.createObjectStore(IDB_STORE_NAME);
+                            }
+                        } catch (e) {
+                            // ストア作成エラーは無視してフォールバック
+                        }
+                    };
+
+                    request.onsuccess = (event) => {
+                        clearTimeout(timer);
+                        if (!settled) {
+                            settled = true;
+                            resolve(event.target.result);
+                        }
+                    };
+
+                    request.onerror = () => {
+                        clearTimeout(timer);
+                        if (!settled) {
+                            settled = true;
+                            resolve(null);
+                        }
+                    };
+
+                    request.onblocked = () => {
+                        clearTimeout(timer);
+                        if (!settled) {
+                            settled = true;
+                            resolve(null);
+                        }
+                    };
+                } catch (e) {
+                    resolve(null);
+                }
+            });
+        }
+
+        async function readFromIndexedDB() {
+            const idb = await openSaveIndexedDB();
+            if (!idb) return null;
+            return new Promise((resolve) => {
+                try {
+                    let settled = false;
+                    const timer = setTimeout(() => {
+                        if (!settled) {
+                            settled = true;
+                            resolve(null);
+                        }
+                    }, 1500);
+
+                    const tx = idb.transaction(IDB_STORE_NAME, 'readonly');
+                    const store = tx.objectStore(IDB_STORE_NAME);
+                    const getReq = store.get(IDB_RECORD_KEY);
+
+                    getReq.onsuccess = () => {
+                        clearTimeout(timer);
+                        if (!settled) {
+                            settled = true;
+                            resolve(normalizeSaveData(getReq.result));
+                        }
+                    };
+                    getReq.onerror = () => {
+                        clearTimeout(timer);
+                        if (!settled) {
+                            settled = true;
+                            resolve(null);
+                        }
+                    };
+                } catch (e) {
+                    resolve(null);
+                }
+            });
+        }
+
+        async function writeToIndexedDB(payload) {
+            const idb = await openSaveIndexedDB();
+            if (!idb) return false;
+            return new Promise((resolve) => {
+                try {
+                    let settled = false;
+                    const timer = setTimeout(() => {
+                        if (!settled) {
+                            settled = true;
+                            resolve(false);
+                        }
+                    }, 1500);
+
+                    const tx = idb.transaction(IDB_STORE_NAME, 'readwrite');
+                    const store = tx.objectStore(IDB_STORE_NAME);
+                    const putReq = store.put(payload, IDB_RECORD_KEY);
+
+                    putReq.onsuccess = () => {
+                        clearTimeout(timer);
+                        if (!settled) {
+                            settled = true;
+                            resolve(true);
+                        }
+                    };
+                    putReq.onerror = () => {
+                        clearTimeout(timer);
+                        if (!settled) {
+                            settled = true;
+                            resolve(false);
+                        }
+                    };
+                } catch (e) {
+                    resolve(false);
+                }
+            });
+        }
+
+        // 復元データをメモリ状態とUIに反映
+        function applySaveDataToState(saveData) {
+            if (!saveData) return;
+            clearedFlags = saveData.clearedFlags.slice(0, TOTAL_QUESTIONS);
+            ownedCards = Array.from(new Set(saveData.ownedCards));
+            currentGlobalQIdx = saveData.currentGlobalQIdx;
+            lastSavedTimestamp = Math.max(lastSavedTimestamp, saveData.timestamp || 0);
+
+            if (typeof saveData.isSoundEnabled === 'boolean') {
+                isSoundEnabled = saveData.isSoundEnabled;
+                const soundOn = document.getElementById('sound-on-icon');
+                const soundOff = document.getElementById('sound-off-icon');
+                if (soundOn) soundOn.classList.toggle('hidden', !isSoundEnabled);
+                if (soundOff) soundOff.classList.toggle('hidden', isSoundEnabled);
+            }
+
+            updateCardBadge();
+            renderMenuCards();
+
+            // ゲーム画面表示中の場合は問題表示も最新状態へ同期
+            const gameScreen = document.getElementById('game-screen');
+            if (gameScreen && !gameScreen.classList.contains('hidden')) {
+                renderQuestion();
+            }
+        }
+
+        // 同期ローカルストレージ（localStorage / sessionStorage / window.name）への即時書き込み
+        function writeToSyncStorages(payload) {
+            writeToLocalStorage(payload);
+            writeToSessionStorage(payload);
+            writeToWindowName(payload);
+        }
+
+        // 全ローカルストレージ（同期3種 + IndexedDB）への多重書き込み
+        async function writeToAllLocalStorages(payload) {
+            writeToSyncStorages(payload);
+            await writeToIndexedDB(payload);
+        }
+
+        // 起動時の即時マルチストレージ復元（同期ストレージ優先→IndexedDB照合）
+        async function restoreLocalSaveDataImmediately() {
+            // 1. 同期ストレージ（localStorage, sessionStorage, window.name）を即座に照合・反映
+            const syncCandidates = [
+                readFromLocalStorage(),
+                readFromSessionStorage(),
+                readFromWindowName()
+            ];
+            const latestSync = selectLatestSaveData(syncCandidates);
+            if (latestSync) {
+                applySaveDataToState(latestSync);
+            }
+
+            // 2. IndexedDB（ディスク永続化領域）から非同期読み込みしてタイムスタンプ比較
+            const idbData = await readFromIndexedDB();
+            const allCandidates = [...syncCandidates, idbData];
+            const overallLatest = selectLatestSaveData(allCandidates);
+
+            // 初期ロード完了をマーク（これ以前の誤上書きを完全に遮断）
+            isInitialLoadComplete = true;
+
+            if (overallLatest) {
+                applySaveDataToState(overallLatest);
+                // 欠損・古いストレージを最新データで同期（バックフィル）
+                await writeToAllLocalStorages(overallLatest);
+            }
+        }
+
+        // ページ離脱・バックグラウンド移行時の緊急セーブ
+        function handlePageLifecycleSave() {
+            if (!isInitialLoadComplete) return;
+            const payload = buildCurrentSavePayload(lastSavedTimestamp || Date.now());
+            // 同期ストレージへ即時書き込み
+            writeToSyncStorages(payload);
+            // IndexedDBへも非同期書き込みをキック
+            writeToIndexedDB(payload);
+        }
 
         async function initFirebase() {
             if (!window.firebaseModules) return;
@@ -599,7 +963,7 @@
             }
         }
 
-        // セーブデータ取得
+        // クラウドセーブデータ取得＆ローカルとのタイムスタンプ照合
         async function loadSaveData() {
             if (!db || !userId) return;
             try {
@@ -607,16 +971,17 @@
                 const docRef = doc(db, 'artifacts', appId, 'users', userId, 'progress', 'data');
                 const docSnap = await getDoc(docRef);
                 if (docSnap.exists()) {
-                    const data = docSnap.data();
-                    if (Array.isArray(data.clearedFlags)) {
-                        clearedFlags = data.clearedFlags;
+                    const cloudData = normalizeSaveData(docSnap.data());
+                    const currentLocal = isInitialLoadComplete ? buildCurrentSavePayload(lastSavedTimestamp) : null;
+                    const winner = selectLatestSaveData([currentLocal, cloudData]);
+
+                    if (winner) {
+                        applySaveDataToState(winner);
+                        await writeToAllLocalStorages(winner);
                     }
-                    if (Array.isArray(data.ownedCards)) {
-                        ownedCards = data.ownedCards;
-                    }
-                    if (typeof data.currentGlobalQIdx === 'number') {
-                        currentGlobalQIdx = data.currentGlobalQIdx;
-                    }
+                } else if (isInitialLoadComplete && lastSavedTimestamp > 0) {
+                    // クラウドが空でローカルに既存データがある場合はクラウドへ同期
+                    await saveProgress();
                 }
             } catch (err) {
                 console.error("Save load error:", err);
@@ -625,20 +990,26 @@
             renderMenuCards();
         }
 
-        // 自動セーブ保存
+        // 自動セーブ保存（全ローカルストレージ＋クラウド）
         async function saveProgress() {
             updateCardBadge();
             renderMenuCards();
+
+            // ロード完了前の誤上書き防止
+            if (!isInitialLoadComplete) return;
+
+            const payload = buildCurrentSavePayload();
+            lastSavedTimestamp = payload.timestamp;
+
+            // 1. localStorage, sessionStorage, window.name, IndexedDB へ多重保存
+            await writeToAllLocalStorages(payload);
+
+            // 2. Firebaseが有効な場合はクラウドへも保存
             if (!db || !userId) return;
             try {
                 const { doc, setDoc } = window.firebaseModules;
                 const docRef = doc(db, 'artifacts', appId, 'users', userId, 'progress', 'data');
-                await setDoc(docRef, {
-                    clearedFlags: clearedFlags,
-                    ownedCards: ownedCards,
-                    currentGlobalQIdx: currentGlobalQIdx,
-                    updatedAt: new Date().toISOString()
-                });
+                await setDoc(docRef, payload);
             } catch (err) {
                 console.error("Save write error:", err);
             }
@@ -736,14 +1107,37 @@
             }
         }
 
-        // 初期化
-        window.onload = async () => {
+        // 初期化（外部リソース完了を待たず、DOM構築直後に即座にデータ復元と描画を実行）
+        async function initApp() {
+            if (isAppInitialized) return;
+            isAppInitialized = true;
+
             setupEventListeners();
             renderMenuCards();
             resizeCanvas();
             window.addEventListener('resize', resizeCanvas);
+
+            // 終了時・バックグラウンド移行時の確実な保存イベント登録
+            window.addEventListener('beforeunload', handlePageLifecycleSave);
+            window.addEventListener('pagehide', handlePageLifecycleSave);
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'hidden') {
+                    handlePageLifecycleSave();
+                }
+            });
+
+            // ローカルマルチストレージからの即時復元・最新データ反映
+            await restoreLocalSaveDataImmediately();
+
+            // クラウド連携（利用可能な場合）
             await initFirebase();
-        };
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initApp);
+        } else {
+            initApp();
+        }
 
         function setupEventListeners() {
             const soundBtn = document.getElementById('sound-toggle-btn');
@@ -754,6 +1148,7 @@
                     const soundOff = document.getElementById('sound-off-icon');
                     if (soundOn) soundOn.classList.toggle('hidden', !isSoundEnabled);
                     if (soundOff) soundOff.classList.toggle('hidden', isSoundEnabled);
+                    saveProgress();
                 });
             }
 
@@ -1099,11 +1494,13 @@
 
             if (currentGlobalQIdx < TOTAL_QUESTIONS - 1) {
                 currentGlobalQIdx++;
+                saveProgress();
                 renderQuestion();
             } else {
                 let nextUncleared = clearedFlags.findIndex(flag => !flag);
                 if (nextUncleared !== -1) {
                     currentGlobalQIdx = nextUncleared;
+                    saveProgress();
                     renderQuestion();
                 } else {
                     showMenu();
